@@ -1,0 +1,28 @@
+# Binaries / build output
+/bin/
+/rostam_server
+/sift1m/rostam_server/rostam_server
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go test / coverage artifacts
+*.test
+*.out
+*.prof
+coverage.txt
+
+# Local cache data dirs the engine may create
+/data/
+*.dat
+
+# Environment / secrets
+.env
+.env.*
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store
+*~

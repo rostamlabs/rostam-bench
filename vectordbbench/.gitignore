@@ -1,0 +1,5 @@
+# A VDBBench checkout created by install.sh — not vendored.
+VectorDBBench/
+__pycache__/
+*.pyc
+logs/

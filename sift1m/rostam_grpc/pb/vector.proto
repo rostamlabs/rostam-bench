@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package vectorbench;
+
+option go_package = "rostamgrpcbench/pb";
+
+// VectorSearch is a minimal gRPC surface over Rostam's vector index, so it can
+// be benchmarked over the SAME transport (gRPC/HTTP2/protobuf) as Qdrant — the
+// only remaining difference is the server implementation, not the wire.
+service VectorSearch {
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+message SearchRequest {
+  string collection = 1;
+  uint32 k = 2;
+  repeated float query = 3;
+}
+
+message Hit {
+  uint64 id = 1;
+  float distance = 2;
+}
+
+message SearchResponse {
+  repeated Hit hits = 1;
+}
