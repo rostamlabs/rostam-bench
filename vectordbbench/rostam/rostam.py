@@ -11,6 +11,7 @@
 # Both insert routes are driven over Rostam's binary bulk wire ("RVB1", see
 # _binary_body) when the server supports it, falling back to the JSON bodies
 # above otherwise. Everything else stays JSON.
+import json
 import logging
 import struct
 from contextlib import contextmanager
@@ -65,6 +66,17 @@ class Rostam(VectorDB):
         # Set once a binary request has actually succeeded; after that a rejection
         # is a real error, not evidence of an old server.
         self._binary_proven = False
+        # The same treatment for the QUERY wire, tracked separately: a server can
+        # speak one and not the other (the bulk framing shipped first), and
+        # conflating them would disable a working path on the strength of the
+        # other one's rejection.
+        self._binary_query = db_config.get("binary_query", True)
+        self._binary_query_proven = False
+        # The filter is fixed for a whole case, so it is encoded once here rather
+        # than per query — otherwise the filtered cases would pay a json.dumps on
+        # the measured path that the unfiltered cases do not, which is a
+        # difference in the harness rather than in the engine.
+        self._filter_blob = b""
 
         s = self._new_session()
         idx = self.case_config.index_param()
@@ -204,12 +216,35 @@ class Rostam(VectorDB):
                 "field": filters.int_field,
                 "value": {"kind": "int", "int": int(filters.int_value)},
             }
+            self._filter_blob = json.dumps(self.query_filter).encode()
             return
         raise RuntimeError(f"unsupported filter for Rostam: {filters}")
 
     def search_embedding(self, query, k: int = 100, *args, **kwargs):
         s = self._sess()
         url = self._url(self.collection_name, "points", "search")
+        # The binary query wire, for the same reason as the bulk one and on the
+        # side of the workload that is actually measured here. A 768d query
+        # serializes to ~9 KB of base-10 text that the server parses back into
+        # the floats this process already holds; as raw f32 it is one numpy
+        # byte-order cast. The harness is known to be a binding constraint on QPS
+        # (see the README's pinned-core control), so work removed from the client
+        # side of a query is work removed from the measurement.
+        if self._binary_query:
+            r = s.post(url, data=_query_body(query, k, self._filter_blob),
+                       headers=_BINARY_HEADERS, timeout=120)
+            if r.status_code in _BINARY_UNSUPPORTED and not self._binary_query_proven:
+                log.warning(
+                    "Rostam server rejected the binary query wire (%s: %s); "
+                    "falling back to JSON queries for the rest of the run",
+                    r.status_code, r.text[:200],
+                )
+                self._binary_query = False
+            else:
+                r.raise_for_status()
+                self._binary_query_proven = True
+                return [int(h["id"]) for h in r.json().get("results", [])]
+
         body = {"query": _to_list(query), "k": k}
         if self.query_filter is not None:
             body["filter"] = self.query_filter
@@ -242,6 +277,31 @@ _BINARY_HEADERS = {"Content-Type": "application/octet-stream"}
 # A server without the binary wire answers 400 (the JSON decoder chokes on the
 # binary body), 415, or 404. All three apply nothing, so the chunk can be resent.
 _BINARY_UNSUPPORTED = (400, 404, 415)
+
+# ---- binary query wire ("RVQ1") ----
+#
+#   magic      b"RVQ1"
+#   flags      u32   bit0 filter present
+#   k          u32
+#   dim        u32
+#   rc/opa     u8/u8, then u16 reserved (zero)
+#   staleness  u64
+#   query      dim x f32
+#   filter     [ len u32 ][ len bytes of JSON ]   (only when bit0)
+#
+# Big-endian like RVB1. Encoding is a single numpy cast to ">f4", so the whole
+# query serializes without touching a float individually.
+_QUERY_MAGIC = b"RVQ1"
+_QUERY_FLAG_FILTER = 1 << 0
+
+
+def _query_body(query, k: int, filter_blob: bytes) -> bytes:
+    q = np.ascontiguousarray(query, dtype=">f4")
+    flags = _QUERY_FLAG_FILTER if filter_blob else 0
+    out = struct.pack(">4sIIIBBHQ", _QUERY_MAGIC, flags, k, q.size, 0, 0, 0, 0) + q.tobytes()
+    if filter_blob:
+        out += struct.pack(">I", len(filter_blob)) + filter_blob
+    return out
 
 
 def _as_f32(embeddings):
