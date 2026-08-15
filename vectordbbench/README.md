@@ -23,9 +23,10 @@ Drives Rostam's HTTP/JSON vector API, mapping VDBBench's lifecycle onto it:
 | `optimize` | `POST /v1/collections/{c}/points/bulk/build` (build HNSW); no-op on the `batch` path |
 | `prepare_filter` / `search_embedding` | `POST /v1/collections/{c}/points/search` (with `filter` for `NumGE` cases) |
 
-All three insert routes are driven over the binary ingest wire by default,
-falling back to their JSON bodies against a server that does not speak it — see
-[Binary ingest wire](#binary-ingest-wire).
+All three insert routes are driven over the binary ingest wire by default, and
+searches over the binary query wire, each falling back to its JSON body against
+a server that does not speak it — see [Binary ingest
+wire](#binary-ingest-wire) and [Binary query wire](#binary-query-wire).
 
 The three load paths differ only in what the wire carries and who does the
 indexing; all end in the same index:
@@ -40,8 +41,8 @@ indexing; all end in the same index:
   `payload` is measured against.
 
 Index knobs (`m`, `ef_construction`, `ef_search`, `metric`, optional `quant`)
-come from `RostamHNSWConfig`. Connection and load-path knobs (`load_path`,
-`binary_wire`) come from `RostamConfig`.
+come from `RostamHNSWConfig`. Connection, load-path and wire knobs
+(`load_path`, `binary_wire`, `binary_query`) come from `RostamConfig`.
 
 ## Files
 
@@ -119,6 +120,12 @@ interpolated **inside** that engine's measured range; blanks are outside it.
 The lead is **stable across the whole range** — 1.8–2.3× against the strongest
 competitors, ~3× Weaviate, ~4× Qdrant, 6.5–7.9× Redis. It does not depend on
 choosing a favourable operating point.
+
+This sweep ran over Rostam's **JSON** query wire. Its binary framing measures
++16.8% at `ef_search=300` (control 3), so these ratios are conservative — by an
+unmeasured amount, since only that one point was run both ways. They are left as
+measured: the competitor arms were not re-run, and a ratio assembled across
+sessions is not a ratio.
 
 ### Highest recall each engine actually reached
 
@@ -220,7 +227,9 @@ floor** (see below). pgvector shows the same: 1,087.1 → 1,086.0.
 
 ## Same-session controls
 
-Each is a pair of runs minutes apart differing in exactly one variable.
+Each varies exactly one thing between runs taken minutes apart in the same
+session. Control 3 runs three pairs rather than one, because its effect is
+small enough relative to the noise floor that a single pair could not carry it.
 
 ### 1. The binary ingest wire moves ingest and nothing else
 
@@ -254,7 +263,37 @@ Recall matches to four decimals and QPS differs by less than half the noise
 floor, so the two paths build an equivalent index — the 6× is purely in how the
 payload reaches the server.
 
-### 3. CPU contention (inconclusive, reported anyway)
+### 3. The binary query wire moves query throughput and nothing else
+
+Three pairs rather than one, because this is the only control here whose effect
+is close enough to the noise floor that a single pair could not carry it. Each
+pair loads the corpus once, then runs both wires against that one index.
+
+| Pair | Corpus loaded by | JSON | Binary | Change |
+|---|---|--:|--:|--:|
+| 1 | JSON | 2,718.3 | 3,163.2 | 1.164× |
+| 2 | binary | 2,738.9 | 3,177.8 | 1.160× |
+| 3 | JSON | 2,776.8 | 3,276.6 | 1.180× |
+
+**+16.8% mean, against the ~6% noise floor control 1 establishes** — roughly
+2.8× the floor, with every individual pair clearing it. Single-client p99 falls
+from 7.8–7.9 ms to 6.2–6.5 ms, and recall is identical within every pair to four
+decimals (0.9692/0.9692, 0.9695/0.9695, 0.9694/0.9694).
+
+**Pair 2 is the control on the control.** It hands the warm index to JSON and
+makes the binary arm pay for the load, reversing the order of pairs 1 and 3. The
+ratio does not move (1.160 against 1.164), which is what separates a transport
+effect from "the second run of a pair is faster".
+
+Within-arm spread is 0.8% for JSON (2,718 / 2,739 / 2,777) and 1.8% for binary
+(3,163 / 3,178 / 3,277) — both inside the noise floor, which is what makes the
+16.8% between arms readable at all.
+
+Measured at `ef_search=300` only. The wire saves a roughly fixed cost per query,
+so it is a larger share of a cheap low-`ef` search and a smaller one at high
+recall: **do not carry this percentage to the other per-ef rows.**
+
+### 4. CPU contention (inconclusive, reported anyway)
 
 Rostam ef=100 with the engine pinned to cores 0–7 and the VDBBench client to
 8–11:
@@ -404,6 +443,37 @@ in that case, so the chunk is simply re-sent). Once one binary request has
 succeeded the fallback is disabled — a later rejection is a real error and must
 surface rather than silently degrading the rest of the load. Set
 `binary_wire=False` to force JSON.
+
+## Binary query wire
+
+`search_embedding` ships the query vector the same way ("RVQ1"), selected by the
+same content type — the read-side counterpart, and the variable in control 3:
+
+```
+magic      b"RVQ1"
+flags      u32   bit0 filter present
+k          u32
+dim        u32
+rc / opa   u8 / u8, then u16 reserved (zero)
+staleness  u64
+query      dim x f32
+filter     [ len u32 ][ len bytes of JSON ]   (only when bit0)
+```
+
+Big-endian like RVB1. Encoding is a single numpy cast to `">f4"`, so the query
+serializes without touching a float individually.
+
+Fallback behaves like the ingest wire's but is **tracked separately**: a server
+can speak one framing and not the other, since the bulk wire shipped first, so
+one path's rejection is not evidence about the other. Set `binary_query=False`
+to force JSON queries — that is exactly what the A/B in control 3 toggles.
+
+The filter is encoded once when the case sets it, not per query, so the filtered
+cases do not pay a `json.dumps` on the measured path that the unfiltered cases
+avoid — that would be a difference in the harness rather than in the engine.
+Turning filtering back off clears the encoded copy along with the filter itself;
+leaving it set would keep the binary arm filtering after the JSON arm stopped,
+which is the same class of harness difference in the other direction.
 
 ## Fairness note
 

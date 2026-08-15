@@ -65,7 +65,7 @@ Three things bound what this means, and they are not footnotes:
   adapter was patched because it tears down a batch executor shared across VDBBench's
   concurrent insert workers.
 
-Full per-ef curves, the filter case, three paired A/B controls, per-engine CPU accounting,
+Full per-ef curves, the filter case, four paired A/B controls, per-engine CPU accounting,
 and the complete caveats are in
 [`vectordbbench/README.md` → Results](./vectordbbench/README.md#results).
 
