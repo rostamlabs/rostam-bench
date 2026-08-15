@@ -201,6 +201,12 @@ class Rostam(VectorDB):
     def prepare_filter(self, filters: Filter):
         if filters.type == FilterOp.NonFilter:
             self.query_filter = None
+            # Clear the encoded copy too. Left set, a preceding filtered case
+            # would keep filtering the binary arm while the JSON arm — which
+            # reads query_filter — stopped, so the two wires would measure
+            # different work and return different rows. That is the kind of
+            # harness difference this pre-encoding exists to prevent.
+            self._filter_blob = b""
             return
         if filters.type == FilterOp.NumGE:
             if self.load_path == "bulk":
