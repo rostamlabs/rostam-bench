@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="" width="64" height="64">
+
 # rostam-bench
 
 Public, reproducible benchmarks comparing the **[Rostam](https://github.com/rostamlabs/rostam)**
