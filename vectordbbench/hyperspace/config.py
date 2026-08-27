@@ -59,6 +59,7 @@ class HyperspaceHNSWConfig(BaseModel, DBCaseConfig):
             "metric": self.parse_metric(),
             "ef_construction": self.ef_construction,
             "ef_search": self.ef_search,
+            "m": self.m,
         }
 
     def search_param(self) -> dict:
