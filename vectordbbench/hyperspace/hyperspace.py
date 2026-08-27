@@ -2,25 +2,26 @@
 #
 # VectorDBBench client for HyperspaceDB (github.com/YARlabs/hyperspace-db),
 # driven through its `hyperspacedb` Python SDK (`from hyperspace import
-# HyperspaceClient`).
+# HyperspaceClient`). VALIDATED against a live HyperspaceDB v3.1.3 server.
 #
-# The point of this client is a FAIR, neutral comparison — the opposite of
-# HyperspaceDB's own bundled harness, which runs competitors untuned and
-# benchmarks them before their index finishes building. Here:
-#   * standard Euclidean HNSW (not hyperbolic), same knobs as every other engine;
-#   * ef_construction / ef_search matched to the swept values;
-#   * optimize() BLOCKS until the index is fully built (polls indexing_queue -> 0)
-#     before any search runs.
+# The point is a FAIR, neutral comparison — the opposite of HyperspaceDB's own
+# bundled harness, which runs competitors untuned and searches them before their
+# index finishes building. Here: standard Euclidean HNSW, and optimize() calls
+# freeze_collection() to finalize/build the index *before* any search.
 #
-# ── VALIDATION STATUS ──────────────────────────────────────────────────────────
-# HyperspaceDB's Python SDK is inconsistently documented (its README describes
-# create_collection/configure/batch_insert/get_collection_stats, but the shipped
-# hyperspace_client.py is a thinner gRPC client). The three calls marked
-# `TODO(validate)` below — collection create/configure, batch insert, and the
-# SEARCH-RESULT id extraction — must be confirmed against a running HyperspaceDB
-# instance (`pip install hyperspacedb`; start the server) and adjusted if the
-# real signatures differ. Everything else (methodology, batching, the
-# wait-for-index poll) is engine-agnostic and correct as written.
+# ── What v3.1.3's SDK actually supports (probed live) ──────────────────────────
+# WORKING:  create_collection(name, schema=...), batch_insert(vectors=, ids=,
+#           collection=), freeze_collection(name) [synchronous build+finalize,
+#           returns "Collection '<n>' frozen."], search(vec, top_k=, collection=)
+#           -> list[dict] with an 'id' key, count(collection=), list_collections().
+# BROKEN / no-op in v3.1.3:  configure(ef_construction/ef_search/m) returns False
+#           (index tuning is NOT applied — HyperspaceDB runs at its DEFAULTS),
+#           rebuild_index() returns False, get_collection_stats() returns {}.
+# CONSEQUENCE: we cannot sweep ef for HyperspaceDB, so it yields a single
+#           (recall, QPS) operating point at its default config — still fair, read
+#           against the other engines' matched-recall curve at HyperspaceDB's own
+#           recall. configure() is still called best-effort (in case a later
+#           version honors it) but its result is not relied upon.
 import logging
 
 import numpy as np
@@ -31,12 +32,11 @@ from ..api import VectorDB
 log = logging.getLogger(__name__)
 
 INSERT_BATCH = 1000
-INDEX_POLL_SECONDS = 2.0
 
 
 class Hyperspace(VectorDB):
-    # Euclidean-HNSW comparison only; filtered cases are not wired (HyperspaceDB
-    # filters are geometric — ball/box/cone — not scalar payload predicates).
+    # Euclidean-HNSW comparison only; HyperspaceDB filters are geometric
+    # (ball/box/cone), not scalar payload predicates, so filtered cases are off.
     supported_filter_types: list[FilterOp] = [FilterOp.NonFilter]
 
     def __init__(
@@ -60,25 +60,9 @@ class Hyperspace(VectorDB):
         client = self._connect()
         if drop_old:
             try:
-                # TODO(validate): confirm the drop method name against the SDK.
                 client.delete_collection(self.collection_name)
             except Exception as e:  # noqa: BLE001 — absent collection is fine
                 log.info("Hyperspace drop_old: %s", e)
-        self._create(client, dim, idx)
-        self._client = None  # each worker process reconnects in init()
-
-    def _connect(self):
-        from hyperspace import HyperspaceClient  # deferred: benchmark-only dep
-
-        # TODO(validate): confirm HyperspaceClient accepts api_key (README says
-        # yes; the shipped client.py __init__ only showed host).
-        if self.api_key:
-            return HyperspaceClient(self.endpoint, api_key=self.api_key)
-        return HyperspaceClient(self.endpoint)
-
-    def _create(self, client, dim: int, idx: dict):
-        # TODO(validate): confirm the schema shape + configure() signature.
-        # Per the SDK README:
         client.create_collection(
             self.collection_name,
             schema={
@@ -93,11 +77,30 @@ class Hyperspace(VectorDB):
                 "cascade_pipeline": [],
             },
         )
-        client.configure(
-            collection=self.collection_name,
-            ef_construction=idx["ef_construction"],
-            ef_search=idx["ef_search"],
-        )
+        # Best-effort tuning. v3.1.3 returns False and ignores it (see header);
+        # kept so a future version that honors it needs no code change.
+        try:
+            applied = client.configure(
+                collection=self.collection_name,
+                ef_construction=idx["ef_construction"],
+                ef_search=idx["ef_search"],
+                m=idx["m"],
+            )
+            if not applied:
+                log.warning(
+                    "Hyperspace configure() returned False — HNSW tuning NOT applied; "
+                    "running at engine defaults (SDK limitation in this version)"
+                )
+        except Exception as e:  # noqa: BLE001
+            log.warning("Hyperspace configure() failed: %s", e)
+        self._client = None  # each worker process reconnects in init()
+
+    def _connect(self):
+        from hyperspace import HyperspaceClient  # deferred: benchmark-only dep
+
+        if self.api_key:
+            return HyperspaceClient(self.endpoint, api_key=self.api_key)
+        return HyperspaceClient(self.endpoint)
 
     # ---- connection lifecycle (one client per worker process) ----
     def init(self):
@@ -116,7 +119,7 @@ class Hyperspace(VectorDB):
     def _c(self):
         return self._client if self._client is not None else self._connect()
 
-    # ---- load (insert; the build is waited on in optimize) ----
+    # ---- load ----
     def insert_embeddings(self, embeddings, metadata, labels_data=None, tenant_labels_data=None, **kwargs):
         client = self._c()
         ids = [int(x) for x in metadata]
@@ -125,7 +128,6 @@ class Hyperspace(VectorDB):
         try:
             for start in range(0, n, INSERT_BATCH):
                 end = min(start + INSERT_BATCH, n)
-                # TODO(validate): confirm batch_insert arg names/shapes.
                 client.batch_insert(
                     vectors=vecs[start:end].tolist(),
                     ids=ids[start:end],
@@ -136,29 +138,15 @@ class Hyperspace(VectorDB):
             return 0, e
 
     def optimize(self, data_size: int | None = None):
-        """Block until the HNSW index has finished building.
+        """Finalize + build the index before any search runs (the fairness step).
 
-        This is the fairness centerpiece: search must run on a *complete* index.
-        HyperspaceDB indexes asynchronously and exposes no wait primitive, so we
-        poll get_collection_stats()['indexing_queue'] until it drains to 0
-        (rather than a fixed sleep, which is what their own harness does to
-        competitors and why those numbers are meaningless).
+        freeze_collection() is HyperspaceDB's synchronous build/finalize call — it
+        returns "Collection '<name>' frozen." once done. Unlike a fixed sleep, this
+        guarantees search runs on a fully built index.
         """
-        import time
-
         client = self._c()
-        deadline = time.monotonic() + 24 * 3600
-        while True:
-            # TODO(validate): confirm get_collection_stats() returns
-            # 'indexing_queue'; adjust the key/method if the SDK differs.
-            stats = client.get_collection_stats(self.collection_name)
-            queued = int(stats.get("indexing_queue", 0)) if isinstance(stats, dict) else 0
-            if queued <= 0:
-                log.info("Hyperspace index built (indexing_queue drained to 0)")
-                return
-            if time.monotonic() > deadline:
-                raise RuntimeError("Hyperspace index build did not complete within 24h")
-            time.sleep(INDEX_POLL_SECONDS)
+        result = client.freeze_collection(self.collection_name)
+        log.info("Hyperspace freeze_collection -> %s", result)
 
     # ---- query ----
     def prepare_filter(self, filters: Filter):
@@ -167,44 +155,6 @@ class Hyperspace(VectorDB):
 
     def search_embedding(self, query, k: int = 100, *args, **kwargs):
         client = self._c()
-        # TODO(validate): confirm search() signature + RESULT SHAPE. The shipped
-        # client returns a raw gRPC response; _extract_ids below tries the common
-        # shapes — pin it to the real one once run against a live instance.
         resp = client.search(np.asarray(query, dtype=np.float32), top_k=k, collection=self.collection_name)
-        return _extract_ids(resp, k)
-
-
-def _extract_ids(resp, k: int) -> list[int]:
-    """Pull integer ids out of a HyperspaceDB search response.
-
-    TODO(validate): HyperspaceDB's search returns a gRPC message whose exact
-    field names aren't confirmable statically. This tries the shapes a vector DB
-    typically returns; replace it with the one real call once verified.
-    """
-    # 1) object with an `.ids` / `.results` attribute
-    for attr in ("ids", "results", "matches", "hits"):
-        val = getattr(resp, attr, None)
-        if val is not None:
-            resp = val
-            break
-    # 2) a dict
-    if isinstance(resp, dict):
-        for key in ("ids", "results", "matches", "hits"):
-            if key in resp:
-                resp = resp[key]
-                break
-    # 3) now `resp` should be an iterable of results; pull an id from each
-    out: list[int] = []
-    try:
-        for r in resp:
-            if isinstance(r, (int, np.integer)):
-                out.append(int(r))
-            elif isinstance(r, dict):
-                out.append(int(r.get("id", r.get("_id"))))
-            else:
-                out.append(int(getattr(r, "id", getattr(r, "_id"))))
-            if len(out) >= k:
-                break
-    except TypeError:
-        pass
-    return out
+        # search() returns a list[dict] each with an 'id' key (validated live).
+        return [int(r["id"]) for r in resp]

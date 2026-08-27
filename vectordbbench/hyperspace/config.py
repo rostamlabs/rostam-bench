@@ -34,15 +34,17 @@ class HyperspaceConfig(DBConfig):
 class HyperspaceHNSWConfig(BaseModel, DBCaseConfig):
     """HNSW index + search parameters, matched to the other engines' knobs.
 
-    NOTE (fairness caveat): HyperspaceDB's SDK exposes ef_construction and
-    ef_search (via ``configure()``) but does NOT expose the HNSW ``M`` parameter,
-    so ``m`` is accepted for interface parity but not applied — HyperspaceDB uses
-    its internal default M. ef_construction / ef_search ARE matched to the swept
-    values, which are the knobs that dominate the recall/QPS tradeoff.
+    NOTE (fairness caveat, validated against HyperspaceDB v3.1.3): the SDK's
+    ``configure(ef_construction, ef_search, m)`` returns False and does NOT apply
+    the tuning — HyperspaceDB runs at its internal DEFAULT HNSW params. These
+    fields are therefore informational (recorded in the run, passed best-effort to
+    configure() in case a later version honors it) but do not change the index.
+    HyperspaceDB thus yields a single (recall, QPS) point at its default config,
+    read against the other engines' matched-recall curve at its own recall.
     """
 
     metric_type: MetricType | None = None
-    m: int = 16  # accepted for parity; not applied (SDK exposes no M)
+    m: int = 16  # informational; v3.1.3 configure() ignores it
     ef_construction: int = 200
     ef_search: int = 64
 
