@@ -42,16 +42,23 @@ wait_up() { for _ in $(seq 1 90); do port_open "$1" && return 0; sleep 1; done; 
 # grow it. UDP is included because memcached and aerospike can open UDP ports too, so
 # a TCP-only check would miss a UDP exposure.
 public_listeners() {
-  # If ss itself fails, we must NOT report an empty set — that would mask a real
-  # exposure. Run it without swallowing errors; a non-zero exit propagates via the
-  # `|| exit` at the sole call sites (BASELINE_PUB capture is preceded by a preflight).
-  { ss -ltnH && ss -lunH; } 2>/dev/null | awk '{print $4}' \
+  # Capture each ss query separately and check its status: if EITHER the TCP or the UDP
+  # snapshot fails we must NOT report a (partial or empty) set — that would mask a real
+  # exposure. Return 2 so the caller aborts; a run() in $() propagates this as the
+  # assignment's exit status. The trailing `return 0` is required because the final
+  # grep -v exits 1 when there are zero public listeners (a legitimate, non-error case)
+  # — without it a clean box would look like an ss failure.
+  local tcp udp
+  tcp="$(ss -ltnH 2>/dev/null)" || return 2
+  udp="$(ss -lunH 2>/dev/null)" || return 2
+  printf '%s\n%s\n' "$tcp" "$udp" | awk 'NF{print $4}' \
     | grep -vE '^127\.|^\[::1\]|^\[::ffff:127\.' | sort -u
+  return 0
 }
 BASELINE_PUB=""
 assert_no_new_public() { # $1 = context label
   local now new
-  now="$(public_listeners)"
+  now="$(public_listeners)" || { log "FATAL: ss failed during '$1' — cannot verify no-public-port; aborting"; exit 5; }
   new="$(comm -13 <(printf '%s\n' "$BASELINE_PUB") <(printf '%s\n' "$now"))"
   if [ -n "$new" ]; then
     log "FATAL: new PUBLIC listener(s) after $1 -> aborting to honour no-public-port:"
@@ -74,11 +81,8 @@ trap 'log "terminated (SIGTERM)"; exit 143' TERM
 
 init() {
   mkdir -p "$RES" "$RES/raw" "$RUN"
-  # The safety net is only as good as `ss`; if it is missing/broken, public_listeners
-  # would report an empty set and mask a real exposure. Verify it up front and refuse.
-  if ! ss -ltnH >/dev/null 2>&1; then
-    echo "FATAL: 'ss' is unavailable — cannot verify the no-public-port guarantee; refusing to run" >&2; exit 5
-  fi
+  # (The no-public-port safety net depends on `ss`; public_listeners now checks both its
+  # TCP and UDP queries and aborts the run if either fails — so no separate preflight.)
   # Truncate (not append): a fresh header per run, so the median summary never mixes
   # rows from a previous sweep. Raw per-rep outputs stay under $RES/raw for debugging.
   printf 'tier\tconfig\tengine\tworkload\tconns\tgens\trep\tops_s\tops\terrs\tp50_us\tp99_us\tp999_us\n' > "$TSV"
@@ -175,6 +179,13 @@ point() { # point <engine> <workload> <conns>
       local ops_s errs p50
       IFS=$'\t' read -r _ _ _ _ _ _ _ ops_s _ errs p50 _ _ <<< "$row"
       log "  ok $e $wl c=$c rep=$rep -> ops/s=$ops_s errs=$errs p50us=$p50"
+      # An errorful rep is not a valid measurement (the summary excludes it), so it must
+      # also make the run non-clean — otherwise a point whose every rep errors yields no
+      # median row yet the script still exits 0.
+      if [ "${errs:-0}" -gt 0 ] 2>/dev/null; then
+        log "  ** $e $wl c=$c rep=$rep had $errs error(s) — not a clean measurement"
+        FAILURES=$((FAILURES + 1))
+      fi
     else
       log "  !! no result line: $e $wl c=$c rep=$rep"; tail -n 2 "$raw/rep$rep.err"
       FAILURES=$((FAILURES + 1))   # a missing measurement must not be silently hidden by DONE
@@ -183,14 +194,17 @@ point() { # point <engine> <workload> <conns>
 }
 
 FAILURES=0   # count of points that produced no result row; a non-zero total fails the run
-init                              # verifies `ss` works (aborts if not) — see the preflight there
-BASELINE_PUB="$(public_listeners)"
+init
+BASELINE_PUB="$(public_listeners)" || { echo "FATAL: ss failed collecting the baseline listener snapshot; refusing to run" >&2; exit 5; }
 log "=== KV LOOPBACK SWEEP: $ENGINES ==="
 log "conns: $CONNS | reps: $REPEATS | ${DURATION}s | engine cpus $ENGINE_CPUS / gen $GEN_CPUS | image $IMAGE"
 log "baseline public listeners (must not grow):"; printf '    %s\n' $BASELINE_PUB
 for e in $ENGINES; do
   log "--- $e ---"
-  start_engine "$e" || { docker rm -f "$CN" >/dev/null 2>&1; continue; }
+  start_engine "$e" || {
+    log "  !! engine $e failed to start — skipping (counts as a run failure)"
+    FAILURES=$((FAILURES + 1)); docker rm -f "$CN" >/dev/null 2>&1; continue
+  }
   assert_no_new_public "$e start"      # hard stop if this engine exposed a public port
   for wl in get put; do for c in $CONNS; do point "$e" "$wl" "$c"; done; done
   docker rm -f "$CN" >/dev/null 2>&1
