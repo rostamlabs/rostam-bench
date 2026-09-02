@@ -44,15 +44,18 @@ wait_up() { for _ in $(seq 1 90); do port_open "$1" && return 0; sleep 1; done; 
 public_listeners() {
   # Capture each ss query separately and check its status: if EITHER the TCP or the UDP
   # snapshot fails we must NOT report a (partial or empty) set — that would mask a real
-  # exposure. Return 2 so the caller aborts; a run() in $() propagates this as the
-  # assignment's exit status. The trailing `return 0` is required because the final
-  # grep -v exits 1 when there are zero public listeners (a legitimate, non-error case)
-  # — without it a clean box would look like an ss failure.
-  local tcp udp
+  # exposure. Return 2 so the caller aborts; the non-zero propagates as the exit status of
+  # `x="$(public_listeners)"`. The loopback filter is done IN awk (not a trailing grep -v),
+  # so there is no "grep exits 1 on no match" ambiguity to special-case, and we still check
+  # that awk and sort themselves succeeded (via PIPESTATUS) before declaring the snapshot good.
+  local tcp udp st
   tcp="$(ss -ltnH 2>/dev/null)" || return 2
   udp="$(ss -lunH 2>/dev/null)" || return 2
-  printf '%s\n%s\n' "$tcp" "$udp" | awk 'NF{print $4}' \
-    | grep -vE '^127\.|^\[::1\]|^\[::ffff:127\.' | sort -u
+  printf '%s\n%s\n' "$tcp" "$udp" \
+    | awk 'NF && $4 !~ /^127\.|^\[::1\]|^\[::ffff:127\./ {print $4}' \
+    | sort -u
+  st=("${PIPESTATUS[@]}")                 # [0]=printf [1]=awk [2]=sort
+  [ "${st[1]}" = 0 ] && [ "${st[2]}" = 0 ] || return 2
   return 0
 }
 BASELINE_PUB=""
@@ -87,12 +90,15 @@ init() {
   # rows from a previous sweep. Raw per-rep outputs stay under $RES/raw for debugging.
   printf 'tier\tconfig\tengine\tworkload\tconns\tgens\trep\tops_s\tops\terrs\tp50_us\tp99_us\tp999_us\n' > "$TSV"
   echo '{"cache":{"max_memory":"2GiB"}}' > "$RUN/cache.json"; chmod 644 "$RUN/cache.json"
-  # Aerospike conf bound to loopback (service address 127.0.0.1; heartbeat/fabric already local).
-  sed 's/address any/address 127.0.0.1/' "$BENCH/aerospike-mem.conf" > "$RUN/aerospike.conf"; chmod 644 "$RUN/aerospike.conf"
-  # Fail loud if the rewrite no-op'd (conf spacing/stanza drift): shipping a lingering
-  # "address any" would bind aerospike's service port to every interface — a public port.
-  if grep -q 'address any' "$RUN/aerospike.conf"; then
-    log "FATAL: aerospike conf still contains 'address any' after loopback rewrite — conf format drifted"; exit 4
+  # Bind EVERY aerospike stanza to loopback: `address any` (service) AND `address local`
+  # (heartbeat/fabric). `local` resolves to a NON-loopback private interface, so under
+  # host networking heartbeat (3002) / fabric (3001) could otherwise land on the public IP.
+  sed -e 's/address any/address 127.0.0.1/' -e 's/address local/address 127.0.0.1/' \
+    "$BENCH/aerospike-mem.conf" > "$RUN/aerospike.conf"; chmod 644 "$RUN/aerospike.conf"
+  # Fail loud if any rewrite no-op'd (conf spacing/stanza drift): a lingering non-loopback
+  # bind directive would expose an aerospike port to every interface.
+  if grep -qE 'address (any|local)' "$RUN/aerospike.conf"; then
+    log "FATAL: aerospike conf still has a non-loopback 'address any/local' after rewrite — conf format drifted"; exit 4
   fi
 }
 
@@ -240,9 +246,10 @@ awk -F'\t' 'NR>1 && $8!="" {
     if (skipped>0) printf "# NOTE: excluded %d errorful rep(s) from the medians above\n", skipped
   }' "$TSV" | sort -t$'\t' -k1,1 -k2,2 -k3,3n | column -t
 
-# A point that produced no measurement means the sweep is incomplete — surface it loudly
-# and exit non-zero so DONE + the summary can never pass off a partial run as a clean one.
+# Any failure — a missing result line, an errorful rep, or an engine that would not start —
+# means the sweep is incomplete. Surface it loudly and exit non-zero so DONE + the summary
+# can never pass off a partial run as a clean one.
 if [ "$FAILURES" -gt 0 ]; then
-  log "RUN INCOMPLETE: $FAILURES point(s) produced no result — see the '!! no result line' entries above"
+  log "RUN INCOMPLETE: $FAILURES failure(s) — missing results, errorful reps, or engines that failed to start; see the '!!' / '**' entries above"
   exit 6
 fi
