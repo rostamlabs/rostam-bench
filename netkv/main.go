@@ -44,7 +44,7 @@ import (
 	redis "github.com/redis/go-redis/v9"
 
 	"github.com/rostamlabs/rostam/client"
-	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 )
 
 // engine abstracts a networked KV store. Setup preloads the keyspace; get/put
@@ -321,8 +321,8 @@ func newRostam(addr string, conns int) (engine, error) {
 	// client round-robins over servers and ~2/3 of writes hit a non-leader ->
 	// NotLeader bounce -> retry (2 round-trips). This matches how the Aerospike
 	// client is partition-aware; omitting it was an accidental handicap.
-	reg := ops.NewRegistry()
-	if err := ops.RegisterBuiltins(reg); err != nil {
+	reg := wire.NewRegistry()
+	if err := wire.RegisterRoutableBuiltins(reg); err != nil {
 		return nil, err
 	}
 	c, err := client.New(client.Config{
@@ -335,7 +335,7 @@ func newRostam(addr string, conns int) (engine, error) {
 		return nil, err
 	}
 	// Probe so a dead server fails fast with a clear error.
-	if _, err := c.Call(context.Background(), "put", ops.EncodePutArgs([]byte("__probe__"), []byte("x"), 0)); err != nil {
+	if _, err := c.Call(context.Background(), "put", wire.EncodePutArgs([]byte("__probe__"), []byte("x"), 0)); err != nil {
 		return nil, fmt.Errorf("rostam: server at %s unreachable: %w", addr, err)
 	}
 	return &rostamEngine{c: c, servers: len(servers)}, nil
@@ -357,18 +357,18 @@ func (e *rostamEngine) semantics() string {
 func (e *rostamEngine) setup(keys [][]byte, val []byte) error {
 	ctx := context.Background()
 	for _, k := range keys {
-		if _, err := e.c.Call(ctx, "put", ops.EncodePutArgs(k, val, 0)); err != nil {
+		if _, err := e.c.Call(ctx, "put", wire.EncodePutArgs(k, val, 0)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 func (e *rostamEngine) get(ctx context.Context, key []byte) error {
-	_, err := e.c.Call(ctx, "get", ops.EncodeKeyArgs(key))
+	_, err := e.c.Call(ctx, "get", wire.EncodeKeyArgs(key))
 	return err
 }
 func (e *rostamEngine) put(ctx context.Context, key, val []byte) error {
-	_, err := e.c.Call(ctx, "put", ops.EncodePutArgs(key, val, 0))
+	_, err := e.c.Call(ctx, "put", wire.EncodePutArgs(key, val, 0))
 	return err
 }
 func (e *rostamEngine) close() {
@@ -394,7 +394,7 @@ func (e *rostamEngine) setupOp(mode string, keys [][]byte) error {
 		return fmt.Errorf("rostam: unsupported mode %q", mode)
 	}
 	for _, k := range keys {
-		if _, err := e.c.Call(ctx, "put", ops.EncodePutArgs(k, seed, 0)); err != nil {
+		if _, err := e.c.Call(ctx, "put", wire.EncodePutArgs(k, seed, 0)); err != nil {
 			return err
 		}
 	}
@@ -410,16 +410,16 @@ func (e *rostamEngine) doOp(mode string, ctx context.Context, rng *rand.Rand, ke
 		// deterministic (see the Raft determinism note in the README).
 		return e.atomicUpdate(ctx, key, rng.Int63n(1000), 10)
 	case "incr":
-		_, err := e.c.Call(ctx, "incr", ops.EncodeIncrArgs(key, 1))
+		_, err := e.c.Call(ctx, "incr", wire.EncodeIncrArgs(key, 1))
 		return err
 	case "cas":
 		return e.casIncr(ctx, key)
 	case "append":
-		args := append(ops.EncodeKeyArgs(key), rostamAppendSuffix...)
+		args := append(wire.EncodeKeyArgs(key), rostamAppendSuffix...)
 		_, err := e.c.Call(ctx, "app", args)
 		return err
 	case "bitmask":
-		_, err := e.c.Call(ctx, "shft", ops.EncodeKeyArgs(key))
+		_, err := e.c.Call(ctx, "shft", wire.EncodeKeyArgs(key))
 		return err
 	default:
 		return fmt.Errorf("rostam: unsupported mode %q", mode)
@@ -429,7 +429,7 @@ func (e *rostamEngine) doOp(mode string, ctx context.Context, rng *rand.Rand, ke
 // getI64 reads an i64 counter via the "get" builtin (response is 8 bytes BE;
 // a shorter/absent response reads as 0).
 func (e *rostamEngine) getI64(ctx context.Context, key []byte) (int64, error) {
-	res, err := e.c.Call(ctx, "get", ops.EncodeKeyArgs(key))
+	res, err := e.c.Call(ctx, "get", wire.EncodeKeyArgs(key))
 	if err != nil {
 		return 0, err
 	}
@@ -448,7 +448,7 @@ func (e *rostamEngine) casIncr(ctx context.Context, key []byte) error {
 		return err
 	}
 	for i := 0; i < 1000; i++ {
-		args := ops.EncodeKeyArgs(key)
+		args := wire.EncodeKeyArgs(key)
 		var p [16]byte
 		binary.BigEndian.PutUint64(p[0:8], uint64(cur))
 		binary.BigEndian.PutUint64(p[8:16], uint64(cur+1))
@@ -472,7 +472,7 @@ func (e *rostamEngine) casIncr(ctx context.Context, key []byte) error {
 // atomicUpdate calls the custom native Go op "aru". args = std [keyLen u16][key]
 // prefix (so the op routes like the builtins) + [streak i64][points i64].
 func (e *rostamEngine) atomicUpdate(ctx context.Context, key []byte, streak, points int64) error {
-	args := ops.EncodeKeyArgs(key)
+	args := wire.EncodeKeyArgs(key)
 	var p [16]byte
 	binary.BigEndian.PutUint64(p[0:8], uint64(streak))
 	binary.BigEndian.PutUint64(p[8:16], uint64(points))
