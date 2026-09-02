@@ -21,7 +21,7 @@ import (
 	"github.com/cespare/xxhash/v2"
 
 	"github.com/rostamlabs/rostam/client"
-	"github.com/rostamlabs/rostam/ops"
+	"github.com/rostamlabs/rostam/sdk/wire"
 	"github.com/rostamlabs/rostam/server"
 )
 
@@ -128,7 +128,7 @@ func (p *pconn) readLoop() {
 
 type rostamPipeEngine struct {
 	base    *client.Client // topology fetch, probe, and the fallback/redirect path
-	topo    atomic.Pointer[ops.Topology]
+	topo    atomic.Pointer[wire.Topology]
 	window  int
 	perNode int
 
@@ -174,7 +174,7 @@ func (e *rostamPipeEngine) refreshTopology() error {
 	if err != nil {
 		return err
 	}
-	t, err := ops.DecodeTopology(payload)
+	t, err := wire.DecodeTopology(payload)
 	if err != nil {
 		return err
 	}
@@ -245,7 +245,7 @@ func (e *rostamPipeEngine) semantics() string {
 func (e *rostamPipeEngine) setup(keys [][]byte, val []byte) error {
 	ctx := context.Background()
 	for _, k := range keys {
-		if _, err := e.base.Call(ctx, "put", ops.EncodePutArgs(k, val, 0)); err != nil {
+		if _, err := e.base.Call(ctx, "put", wire.EncodePutArgs(k, val, 0)); err != nil {
 			return err
 		}
 	}
@@ -253,11 +253,11 @@ func (e *rostamPipeEngine) setup(keys [][]byte, val []byte) error {
 }
 
 func (e *rostamPipeEngine) get(ctx context.Context, key []byte) error {
-	return e.call(ctx, "get", key, ops.EncodeKeyArgs(key))
+	return e.call(ctx, "get", key, wire.EncodeKeyArgs(key))
 }
 
 func (e *rostamPipeEngine) put(ctx context.Context, key, val []byte) error {
-	return e.call(ctx, "put", key, ops.EncodePutArgs(key, val, 0))
+	return e.call(ctx, "put", key, wire.EncodePutArgs(key, val, 0))
 }
 
 func (e *rostamPipeEngine) close() {
