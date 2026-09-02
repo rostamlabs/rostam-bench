@@ -31,7 +31,7 @@ P_ROSTAM=17000; P_REDIS=6379; P_DFLY=6380; P_KEYDB=6381; P_VALKEY=6382; P_MC=112
 IMG_REDIS=redis:7; IMG_VALKEY=valkey/valkey:8; IMG_DFLY=docker.dragonflydb.io/dragonflydb/dragonfly:latest
 IMG_KEYDB=eqalpha/keydb:latest; IMG_MC=memcached:1.6; IMG_AERO=aerospike/aerospike-server:latest
 
-CN=kvlb0   # single reused container name
+CN="kvlb-$$"   # PID-scoped container name: never force-removes a pre-existing unrelated container
 
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 port_open() { (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null; }
@@ -42,7 +42,10 @@ wait_up() { for _ in $(seq 1 90); do port_open "$1" && return 0; sleep 1; done; 
 # grow it. UDP is included because memcached and aerospike can open UDP ports too, so
 # a TCP-only check would miss a UDP exposure.
 public_listeners() {
-  { ss -ltnH 2>/dev/null; ss -lunH 2>/dev/null; } | awk '{print $4}' \
+  # If ss itself fails, we must NOT report an empty set — that would mask a real
+  # exposure. Run it without swallowing errors; a non-zero exit propagates via the
+  # `|| exit` at the sole call sites (BASELINE_PUB capture is preceded by a preflight).
+  { ss -ltnH && ss -lunH; } 2>/dev/null | awk '{print $4}' \
     | grep -vE '^127\.|^\[::1\]|^\[::ffff:127\.' | sort -u
 }
 BASELINE_PUB=""
@@ -62,11 +65,23 @@ cleanup() {
   docker rm -f "$CN" >/dev/null 2>&1
   log "cleanup: removed container $CN (if any)"
 }
-trap cleanup EXIT INT TERM
+# Cleanup runs once, on EXIT. A signal must EXIT (not just clean up and let the sweep
+# continue to start later engines) — so the signal handlers only set an exit status,
+# and their exit unwinds through the EXIT trap which does the single cleanup.
+trap cleanup EXIT
+trap 'log "interrupted (SIGINT)";  exit 130' INT
+trap 'log "terminated (SIGTERM)"; exit 143' TERM
 
 init() {
   mkdir -p "$RES" "$RES/raw" "$RUN"
-  [ -f "$TSV" ] || printf 'tier\tconfig\tengine\tworkload\tconns\tgens\trep\tops_s\tops\terrs\tp50_us\tp99_us\tp999_us\n' > "$TSV"
+  # The safety net is only as good as `ss`; if it is missing/broken, public_listeners
+  # would report an empty set and mask a real exposure. Verify it up front and refuse.
+  if ! ss -ltnH >/dev/null 2>&1; then
+    echo "FATAL: 'ss' is unavailable — cannot verify the no-public-port guarantee; refusing to run" >&2; exit 5
+  fi
+  # Truncate (not append): a fresh header per run, so the median summary never mixes
+  # rows from a previous sweep. Raw per-rep outputs stay under $RES/raw for debugging.
+  printf 'tier\tconfig\tengine\tworkload\tconns\tgens\trep\tops_s\tops\terrs\tp50_us\tp99_us\tp999_us\n' > "$TSV"
   echo '{"cache":{"max_memory":"2GiB"}}' > "$RUN/cache.json"; chmod 644 "$RUN/cache.json"
   # Aerospike conf bound to loopback (service address 127.0.0.1; heartbeat/fabric already local).
   sed 's/address any/address 127.0.0.1/' "$BENCH/aerospike-mem.conf" > "$RUN/aerospike.conf"; chmod 644 "$RUN/aerospike.conf"
@@ -162,11 +177,13 @@ point() { # point <engine> <workload> <conns>
       log "  ok $e $wl c=$c rep=$rep -> ops/s=$ops_s errs=$errs p50us=$p50"
     else
       log "  !! no result line: $e $wl c=$c rep=$rep"; tail -n 2 "$raw/rep$rep.err"
+      FAILURES=$((FAILURES + 1))   # a missing measurement must not be silently hidden by DONE
     fi
   done
 }
 
-init
+FAILURES=0   # count of points that produced no result row; a non-zero total fails the run
+init                              # verifies `ss` works (aborts if not) — see the preflight there
 BASELINE_PUB="$(public_listeners)"
 log "=== KV LOOPBACK SWEEP: $ENGINES ==="
 log "conns: $CONNS | reps: $REPEATS | ${DURATION}s | engine cpus $ENGINE_CPUS / gen $GEN_CPUS | image $IMAGE"
@@ -183,9 +200,12 @@ log "=== DONE ==="
 assert_no_new_public "sweep end"
 log "verified: no public listener added by the sweep"
 
-# Median-of-reps summary straight from the TSV (no external deps).
-log "=== SUMMARY (median ops/s across reps) ==="
+# Median-of-reps summary straight from the TSV (no external deps). Rows with errors
+# ($10 > 0) are EXCLUDED — a throughput figure measured while ops were failing is not
+# comparable — and counted so the exclusion is visible rather than silent.
+log "=== SUMMARY (median ops/s across reps; errorful reps excluded) ==="
 awk -F'\t' 'NR>1 && $8!="" {
+    if ($10+0 > 0) { skipped++; next }   # errorful rep: do not rank its ops/s
     k=$3"\t"$4"\t"$5; n[k]++; v[k","n[k]]=$8
   }
   END {
@@ -198,4 +218,12 @@ awk -F'\t' 'NR>1 && $8!="" {
       printf "%s\t%.0f\t%d\n", k, med, c
       delete a
     }
+    if (skipped>0) printf "# NOTE: excluded %d errorful rep(s) from the medians above\n", skipped
   }' "$TSV" | sort -t$'\t' -k1,1 -k2,2 -k3,3n | column -t
+
+# A point that produced no measurement means the sweep is incomplete — surface it loudly
+# and exit non-zero so DONE + the summary can never pass off a partial run as a clean one.
+if [ "$FAILURES" -gt 0 ]; then
+  log "RUN INCOMPLETE: $FAILURES point(s) produced no result — see the '!! no result line' entries above"
+  exit 6
+fi

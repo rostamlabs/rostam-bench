@@ -315,7 +315,7 @@ func newRostam(addr string, conns int) (engine, error) {
 	// every write through one node, which forwards non-local-leader shards (an
 	// extra hop) — a latency handicap on a distributed cluster.
 	servers := strings.Split(addr, ",")
-	// Give the client the ops registry so it does SHARD-AWARE LEADER ROUTING:
+	// Give the client the wire routing registry so it does SHARD-AWARE LEADER ROUTING:
 	// it extracts the key, computes shardOf(key)=xxhash%NumShards (identical to
 	// the server), and sends straight to that shard's leader. Without this the
 	// client round-robins over servers and ~2/3 of writes hit a non-leader ->
