@@ -128,7 +128,12 @@ start_engine() {
       drun $IMG_MC -l 127.0.0.1 -m 4096 -c 20000 -t $EMAX -p $P_MC
       wait_up $P_MC ;;
     aerospike)
-      drun -v "$RUN/aerospike.conf:/etc/aerospike/aerospike.conf" $IMG_AERO
+      # The aerospike image ENTRYPOINT regenerates /etc/aerospike/aerospike.conf from a
+      # template on start, clobbering a mounted conf (so `service address` stays `any` →
+      # 0.0.0.0, a public port). Bypass it: run `asd` directly against our loopback conf
+      # at a NON-default path, so nothing regenerates it and the service binds 127.0.0.1.
+      drun -v "$RUN/aerospike.conf:/opt/aero.conf:ro" --entrypoint asd \
+        $IMG_AERO --config-file /opt/aero.conf --foreground
       wait_up $P_AERO && sleep 8 ;;
     *) log "unknown engine $e"; return 1 ;;
   esac || { log "FATAL: $e never listened"; docker logs "$CN" 2>&1 | tail -8; return 1; }
